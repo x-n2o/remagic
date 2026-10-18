@@ -47,9 +47,11 @@ the beta tablet uses a locally built bundle instead.
   version switching disabled. Root was confirmed read-only after deployment
   and reboot. The API configuration is mode 0600.
 
-Hands-on acceptance is still pending for visible AppLoad/Diary navigation,
-pen input, a handwritten reply, sleep/wake and five-finger exit. Automated
-display calls and a synthetic API response do not establish these results.
+The user subsequently confirmed the AppLoad/Diary flow and handwritten exchange
+work. The sleep/wake test subsequently froze on the diary's sleep page with USB
+unavailable and needs recovery/investigation. Five-finger exit remains unverified.
+Riddle's later cinematic pacing option was installed without interrupting the
+open diary; that animation needs reopening and visual acceptance as well.
 
 ## Recovery
 
