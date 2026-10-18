@@ -9,6 +9,7 @@ Linux/macOS/Windows ship on [releases](https://github.com/maximerivest/remagic/r
 go build -o remagic .          # or grab a release binary
 ./remagic setup                # full install: key, xovi, AppLoad, tripletap, Store
 ./remagic --skip-ssh-key setup # keep externally managed keys unchanged
+./remagic rebuild-hashtab      # rebuild the resource table and validate AppLoad
 ./remagic find                 # discovers tablets (USB + LAN scan)
 ./remagic doctor               # health check: stack, SSH, battery, apps
 ./remagic key                  # passwordless SSH from then on
