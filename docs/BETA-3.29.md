@@ -48,10 +48,16 @@ the beta tablet uses a locally built bundle instead.
   and reboot. The API configuration is mode 0600.
 
 The user subsequently confirmed the AppLoad/Diary flow and handwritten exchange
-work. The sleep/wake test subsequently froze on the diary's sleep page with USB
-unavailable and needs recovery/investigation. Five-finger exit remains unverified.
-Riddle's later cinematic pacing option was installed without interrupting the
-open diary; that animation needs reopening and visual acceptance as well.
+work. The original sleep/wake test subsequently froze on the diary's sleep page
+with USB unavailable, requiring a physical restart. Riddle's replacement
+sleep flow waits for panel discharge without blocking input, then waits for
+the actual suspend/resume transaction rather than its enqueue acknowledgement.
+An injected power pair restored the page immediately; an injected five-finger
+gesture exited cleanly. The corrected deep-sleep test incremented the kernel
+success counter and woke via a temporary RTC alarm, without rebooting.
+Physical power-button wake and unplugged launcher visibility remain pending
+user confirmation. Riddle's cinematic pacing option is selected and active;
+its visual timing also awaits user acceptance.
 
 ## Recovery
 
