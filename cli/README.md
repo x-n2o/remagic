@@ -8,6 +8,7 @@ Linux/macOS/Windows ship on [releases](https://github.com/maximerivest/remagic/r
 ```
 go build -o remagic .          # or grab a release binary
 ./remagic setup                # full install: key, xovi, AppLoad, tripletap, Store
+./remagic --skip-ssh-key setup # keep externally managed keys unchanged
 ./remagic find                 # discovers tablets (USB + LAN scan)
 ./remagic doctor               # health check: stack, SSH, battery, apps
 ./remagic key                  # passwordless SSH from then on
@@ -30,6 +31,10 @@ Highlights:
   tablet over SSH, `chmod 600`.
 - Pure Go SSH: no ssh binary, no ControlMaster, same behavior on
   macOS / Linux / Windows.
+- SSH authentication uses `SSH_AUTH_SOCK` and also discovers 1Password's
+  standard Unix sockets. Every reconnect opens a new agent connection, so
+  an idle agent socket cannot strand a resource-table rebuild. Password-only
+  setup keeps the supplied password in memory for reconnects.
 
 `catalog.json` at the repo root is the app registry; the same file feeds the
 on-device Store app (`store/` in this directory).

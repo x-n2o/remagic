@@ -17,8 +17,34 @@ func TestConnectKeyOnlyLive(t *testing.T) {
 		t.Fatalf("ConnectKeyOnly: %v", err)
 	}
 	defer d.Close()
+	fresh, err := d.Fresh()
+	if err != nil {
+		t.Fatalf("Fresh: %v", err)
+	}
+	fresh.Close()
 	out, err := d.Run("echo key-only-ok")
 	if err != nil || !strings.Contains(out, "key-only-ok") {
 		t.Fatalf("run: %v %q", err, out)
+	}
+}
+
+func TestConnectFreshLive(t *testing.T) {
+	host := os.Getenv("REMAGIC_TEST_HOST")
+	if host == "" {
+		t.Skip("REMAGIC_TEST_HOST not set")
+	}
+	d, err := Connect(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	fresh, err := d.Fresh()
+	if err != nil {
+		t.Fatalf("Fresh: %v", err)
+	}
+	defer fresh.Close()
+	out, err := fresh.Run("echo fresh-ok")
+	if err != nil || strings.TrimSpace(out) != "fresh-ok" {
+		t.Fatalf("%v %q", err, out)
 	}
 }

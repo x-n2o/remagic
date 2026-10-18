@@ -51,6 +51,7 @@ options (before the command):
   -host <addr>            tablet address (default: found automatically)
   -catalog <url>          app catalog URL
   -local                  config: serve on 127.0.0.1 only (no QR/phone)
+  --skip-ssh-key          setup: preserve externally managed SSH keys
   -version <v>            publish: version (default: manifest "version")
   -catalog-dir <path>     publish: local remagic checkout whose catalog.json
                           gets the new entry written in place
@@ -60,6 +61,7 @@ func main() {
 	host := ""
 	catalogURL := registry.DefaultCatalogURL
 	localOnly := false
+	skipSSHKey := false
 	pubVersion := ""
 	catalogDir := ""
 
@@ -78,6 +80,8 @@ func main() {
 			catalogURL, args = args[1], args[2:]
 		case "-local", "--local":
 			localOnly, args = true, args[1:]
+		case "-skip-ssh-key", "--skip-ssh-key":
+			skipSSHKey, args = true, args[1:]
 		case "-version", "--version":
 			if len(args) < 2 {
 				die("-version needs a value")
@@ -102,7 +106,7 @@ func main() {
 	case "version":
 		fmt.Println("remagic", version)
 	case "setup":
-		cmdSetup(mustConnect(host), catalogURL)
+		cmdSetup(mustConnect(host), catalogURL, skipSSHKey)
 	case "find":
 		cmdFind()
 	case "doctor":

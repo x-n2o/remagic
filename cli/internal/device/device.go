@@ -26,59 +26,90 @@ const DefaultUSBAddr = "10.11.99.1"
 const ApploadDir = "/home/root/xovi/exthome/appload"
 
 type Device struct {
-	Addr   string
-	client *ssh.Client
+	Addr        string
+	client      *ssh.Client
+	config      *ssh.ClientConfig
+	password    string
+	hasPassword bool
 }
 
 // nonInteractiveAuths collects the auth methods that never prompt: the
 // ssh-agent plus the usual key files.
-func nonInteractiveAuths() []ssh.AuthMethod {
-	var auths []ssh.AuthMethod
-	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+func nonInteractiveAuths() ([]ssh.AuthMethod, func()) {
+	var signers []ssh.Signer
+	var agentConns []net.Conn
+	home, _ := os.UserHomeDir()
+	// OpenSSH reads IdentityAgent from ssh_config; the pure-Go CLI does not.
+	// Also try 1Password's standard Unix sockets without changing ssh_config.
+	sockets := []string{os.Getenv("SSH_AUTH_SOCK"), filepath.Join(home, ".1password", "agent.sock"),
+		filepath.Join(home, "Library", "Group Containers", "2BUA8C4S2C.com.1password", "t", "agent.sock")}
+	seen := map[string]bool{}
+	for _, sock := range sockets {
+		if sock == "" || seen[sock] {
+			continue
+		}
+		seen[sock] = true
 		if conn, err := net.Dial("unix", sock); err == nil {
-			auths = append(auths, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+			agentConns = append(agentConns, conn)
+			if keys, err := agent.NewClient(conn).Signers(); err == nil {
+				signers = append(signers, keys...)
+			}
 		}
 	}
-	home, _ := os.UserHomeDir()
 	for _, name := range []string{"id_ed25519", "id_rsa"} {
 		b, err := os.ReadFile(filepath.Join(home, ".ssh", name))
 		if err != nil {
 			continue
 		}
 		if signer, err := ssh.ParsePrivateKey(b); err == nil {
-			auths = append(auths, ssh.PublicKeys(signer))
+			signers = append(signers, signer)
 		}
 	}
-	return auths
+	var auths []ssh.AuthMethod
+	if len(signers) > 0 {
+		auths = append(auths, ssh.PublicKeys(signers...))
+	}
+	return auths, func() {
+		for _, conn := range agentConns {
+			conn.Close()
+		}
+	}
 }
 
 // ConnectKeyOnly dials with only non-interactive auth (agent + key files) on
 // a genuinely fresh connection. Use it to prove the NEXT person to connect
 // will get in — e.g. after an installer step that can wedge the SSH server.
 func ConnectKeyOnly(addr string) (*Device, error) {
+	auths, closeAgent := nonInteractiveAuths()
+	defer closeAgent()
 	cfg := &ssh.ClientConfig{
 		User:            "root",
-		Auth:            nonInteractiveAuths(),
+		Auth:            auths,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         8 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", net.JoinHostPort(addr, "22"), cfg)
+	client, err := dialSSH(net.JoinHostPort(addr, "22"), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect root@%s: %w", addr, err)
 	}
-	return &Device{Addr: addr, client: client}, nil
+	return &Device{Addr: addr, client: client, config: cfg}, nil
 }
 
 // Connect dials root@addr trying, in order: the ssh-agent, the usual key
 // files, then an interactive password prompt (the code on the tablet under
 // Settings → Help → Copyrights and licenses).
 func Connect(addr string) (*Device, error) {
-	auths := nonInteractiveAuths()
+	auths, closeAgent := nonInteractiveAuths()
+	defer closeAgent()
+	var password string
+	hasPassword := false
 	auths = append(auths, ssh.RetryableAuthMethod(ssh.PasswordCallback(func() (string, error) {
 		fmt.Fprintf(os.Stderr, "password for root@%s (tablet: Settings → Help → Copyrights and licenses): ", addr)
 		b, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Fprintln(os.Stderr)
-		return strings.TrimSpace(string(b)), err
+		password = strings.TrimSpace(string(b))
+		hasPassword = err == nil
+		return password, err
 	}), 3))
 	cfg := &ssh.ClientConfig{
 		User: "root",
@@ -90,11 +121,57 @@ func Connect(addr string) (*Device, error) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         8 * time.Second,
 	}
+	// Interactive password/agent approval time must not count as a stalled
+	// handshake. Reconnects below are non-interactive and have a deadline.
 	client, err := ssh.Dial("tcp", net.JoinHostPort(addr, "22"), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect root@%s: %w", addr, err)
 	}
-	return &Device{Addr: addr, client: client}, nil
+	return &Device{Addr: addr, client: client, config: cfg, password: password, hasPassword: hasPassword}, nil
+}
+
+// Fresh reconnects using the successful authentication configuration. Passwords
+// are retained only in memory, so skipping key installation also works when
+// setup temporarily interrupts the connection.
+func (d *Device) Fresh() (*Device, error) {
+	if d.config == nil {
+		return ConnectKeyOnly(d.Addr)
+	}
+	// Agents can close idle connections while the device rebuilds resources.
+	// Open a new agent connection for every handshake; never reuse stale signers.
+	auths, closeAgent := nonInteractiveAuths()
+	defer closeAgent()
+	if d.hasPassword {
+		auths = append(auths, ssh.Password(d.password))
+	}
+	cfg := *d.config
+	cfg.Auth = auths
+	endpoint := net.JoinHostPort(d.Addr, "22")
+	if d.client != nil {
+		endpoint = d.client.RemoteAddr().String()
+	}
+	client, err := dialSSH(endpoint, &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("reconnect root@%s: %w", d.Addr, err)
+	}
+	return &Device{Addr: d.Addr, client: client, config: &cfg, password: d.password, hasPassword: d.hasPassword}, nil
+}
+
+// ClientConfig.Timeout only bounds the TCP dial. Bound the SSH handshake too:
+// xochitl restarts can leave an accepted USB connection silent indefinitely.
+func dialSSH(endpoint string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	conn, err := net.DialTimeout("tcp", endpoint, cfg.Timeout)
+	if err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Now().Add(cfg.Timeout))
+	transport, channels, requests, err := ssh.NewClientConn(conn, endpoint, cfg)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	conn.SetDeadline(time.Time{})
+	return ssh.NewClient(transport, channels, requests), nil
 }
 
 func (d *Device) Close() {

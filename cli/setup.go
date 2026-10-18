@@ -21,20 +21,68 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/maximerivest/remagic/cli/internal/device"
+	"github.com/maximerivest/remagic/cli/internal/setupassets"
 )
 
 // Pinned upstream releases (same pins as scripts/sources.env).
 const (
 	xoviBundleURL = "https://github.com/asivery/rm-xovi-extensions/releases/download/v19-23052026/xovi-aarch64.tar.gz"
-	apploadURL    = "https://github.com/asivery/rm-appload/releases/download/v0.5.3/appload-aarch64.zip"
 	tripletapURL  = "https://raw.githubusercontent.com/rmitchellscott/xovi-tripletap/main/install.sh"
 )
 
-func cmdSetup(d *device.Device, catalogURL string) {
+type apploadRelease struct {
+	Version string
+	URL     string
+	Archive string
+}
+
+func selectAppload(osVersion string) (apploadRelease, error) {
+	parts := strings.Split(strings.TrimSpace(osVersion), ".")
+	if len(parts) < 2 {
+		return apploadRelease{}, fmt.Errorf("cannot select AppLoad for OS %q", osVersion)
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || major != 3 || minor < 0 || minor > 29 {
+		return apploadRelease{}, fmt.Errorf("OS %q is outside the validated AppLoad range (3.x through 3.29)", osVersion)
+	}
+	version, archive := "v0.5.3", "appload-aarch64.zip"
+	if minor >= 28 {
+		version, archive = "v0.6.0", "appload-aarch64.tar.gz"
+	}
+	return apploadRelease{version, "https://github.com/asivery/rm-appload/releases/download/" + version + "/" + archive, archive}, nil
+}
+
+func setupSSHKey(d *device.Device, skip bool) error {
+	if skip {
+		return nil
+	}
+	return ensureSSHKey(d)
+}
+
+func restoreStock(d *device.Device) string {
+	const command = `systemctl reset-failed xochitl && /home/root/xovi/stock && systemctl reset-failed xochitl && systemctl start xochitl && systemctl is-active --quiet xochitl`
+	_, err := d.Run(command)
+	if err != nil {
+		fresh, ferr := d.Fresh()
+		if ferr != nil {
+			return fmt.Sprintf("could not verify stock UI recovery: %v", ferr)
+		}
+		defer fresh.Close()
+		_, err = fresh.Run(command)
+	}
+	if err != nil {
+		return fmt.Sprintf("stock UI recovery failed: %v", err)
+	}
+	return "stock UI restored"
+}
+
+func cmdSetup(d *device.Device, catalogURL string, skipSSHKey bool) {
 	defer d.Close()
 
 	fmt.Println(`
@@ -42,13 +90,13 @@ func cmdSetup(d *device.Device, catalogURL string) {
 
   This will, over the connection just opened:
     1. Verify this is a Paper Pro in developer mode
-    2. Install an SSH key (no more passwords; one is created if you have none)
+    2. Set up SSH authentication (or preserve keys with --skip-ssh-key)
     3. Install xovi + the AppLoad launcher (official upstream releases)
-    4. Set up power-button persistence (triple-press toggles xovi)
+    4. Set up power-button persistence (preserving existing configuration)
     5. Install the Store app, so future installs need no computer
 
-  Nothing here touches your notebooks or the bootloader. A triple-press or a
-  reboot returns you to stock reMarkable instantly.`)
+  Nothing here touches your notebooks or the bootloader. Rebooting returns
+  you to stock reMarkable; triple-press enables xovi again.`)
 	fmt.Println()
 
 	// ---- 1. preflight -----------------------------------------------------
@@ -59,14 +107,32 @@ func cmdSetup(d *device.Device, catalogURL string) {
 		die("device reports %q — remagic targets the reMarkable Paper Pro (Ferrari/Chiappa/Tatsu); refusing to touch an unrecognized device", model)
 	}
 	ok("device: %s", model)
-	if osv, err := d.Run(`. /etc/os-release 2>/dev/null; printf %s "$IMG_VERSION"`); err == nil && strings.TrimSpace(osv) != "" {
-		ok("OS version: %s", strings.TrimSpace(osv))
+	osv, err := d.Run(`. /etc/os-release; printf %s "$IMG_VERSION"`)
+	if err != nil {
+		die("read OS version: %v", err)
 	}
+	release, err := selectAppload(osv)
+	if err != nil {
+		die("%v", err)
+	}
+	ok("OS %s: AppLoad %s", strings.TrimSpace(osv), release.Version)
 
-	// ---- 2. ssh key --------------------------------------------------------
-	step("setting up passwordless SSH")
-	if err := ensureSSHKey(d); err != nil {
-		warn("SSH key setup failed (%v) — continuing; you'll keep typing the password", err)
+	step("setting up SSH")
+	if err := setupSSHKey(d, skipSSHKey); err != nil {
+		die("SSH setup: %v", err)
+	}
+	if skipSSHKey {
+		ok("preserving existing SSH keys (key setup skipped)")
+	}
+	// Stop old hooks before replacing any of their files.
+	if _, err := d.Run(`systemctl reset-failed xochitl; if [ -x /home/root/xovi/stock ]; then /home/root/xovi/stock; fi`); err != nil {
+		die("could not restore stock UI before setup: %v", err)
+	}
+	if _, err := d.Run(`if [ -f /home/root/xovi/extensions.d/appload.so ]; then
+mkdir -p /home/root/xovi/exthome/appload
+mv /home/root/xovi/extensions.d/appload.so /home/root/xovi/exthome/appload/.remagic-appload.so
+fi`); err != nil {
+		die("could not stage existing AppLoad hooks: %v", err)
 	}
 
 	// ---- 3. xovi bundle ----------------------------------------------------
@@ -90,27 +156,22 @@ mv -f /home/root/xovi/inactive-extensions/xovi-message-broker.so /home/root/xovi
 
 	// ---- 4. AppLoad ---------------------------------------------------------
 	step("downloading AppLoad")
-	appload, err := fetchURL(apploadURL)
+	appload, err := fetchURL(release.URL)
 	if err != nil {
 		die("download AppLoad: %v", err)
 	}
 	ok("%d KB", len(appload)/1024)
 	step("installing the AppLoad launcher")
-	if err := d.Push(appload, "/tmp/appload.zip", "644"); err != nil {
+	if err := d.Push(appload, "/tmp/"+release.Archive, "644"); err != nil {
 		die("%v", err)
 	}
-	// ONLY appload.so is a xovi extension → extensions.d/. The zip also
-	// carries shims/qtfb-shim*.so (runtime pieces for windowed apps) which
-	// must NOT land in extensions.d/ or xovi tries to load them and errors.
-	if out, err := d.Run(`cd /tmp && rm -rf appload-unz && mkdir appload-unz && \
-(unzip -oq appload.zip -d appload-unz || busybox unzip -o appload.zip -d appload-unz) && \
-cp -f appload-unz/appload.so /home/root/xovi/extensions.d/ && \
-mkdir -p /home/root/xovi/exthome/appload && \
-if [ -d appload-unz/shims ]; then cp -rf appload-unz/shims /home/root/xovi/exthome/appload/; fi && \
-if [ -d appload-unz/exthome ]; then cp -rf appload-unz/exthome/. /home/root/xovi/exthome/; fi && \
-rm -rf appload-unz appload.zip`); err != nil {
-		die("install AppLoad: %v: %s", err, out)
+	if err := d.Push([]byte(setupassets.InstallAppload), "/tmp/remagic-install-appload.sh", "755"); err != nil {
+		die("%v", err)
 	}
+	if out, err := d.Run("bash /tmp/remagic-install-appload.sh /tmp/" + release.Archive); err != nil {
+		die("install AppLoad: %v: %s; %s", err, out, restoreStock(d))
+	}
+
 	ok("AppLoad installed")
 
 	// ---- 5. Qt hashtable -----------------------------------------------------
@@ -123,36 +184,39 @@ rm -rf appload-unz appload.zip`); err != nil {
 	// result over fresh connections.
 	step("building the Qt resource hashtable (AppLoad's UI hook needs it; ~1-2 min)")
 	if err := rebuildHashtable(d); err != nil {
-		warn("hashtable build failed: %v", err)
-		warn("the AppLoad button may not appear — rerun 'remagic setup' or run /home/root/xovi/rebuild_hashtable over ssh")
-	} else {
-		ok("hashtable built")
+		die("Qt resource table build failed: %v; %s", err, restoreStock(d))
 	}
-	// The rebuild (and later steps) can drop the shared connection; heal it.
+	ok("hashtable built")
 	if _, err := d.Run("true"); err != nil {
-		if fresh, cerr := device.ConnectKeyOnly(d.Addr); cerr == nil {
+		if fresh, cerr := d.Fresh(); cerr == nil {
+			d.Close()
 			*d = *fresh
+		} else {
+			die("reconnect: %v", cerr)
 		}
 	}
 
 	// ---- 6. tripletap persistence -------------------------------------------
 	step("installing power-button persistence (xovi-tripletap)")
-	fmt.Println("    triple-press the power button to toggle xovi — survives reboots,")
-	fmt.Println("    needs no computer, and can't bootloop you")
-	tt, err := fetchURL(tripletapURL)
-	if err != nil {
-		warn("download tripletap: %v — skipping; start xovi manually after reboots", err)
-	} else if out, err := d.RunIn("bash -s", strings.NewReader(string(tt))); err != nil {
-		warn("tripletap install didn't complete: %v: %s", err, tail(out, 300))
-		warn("you can still start xovi manually: ssh root@%s '/home/root/xovi/start'", d.Addr)
+	fmt.Println("    triple-press enables xovi after a reboot; existing settings are preserved")
+	if _, err := d.Run("systemctl is-active --quiet xovi-tripletap && systemctl is-enabled --quiet xovi-tripletap"); err == nil {
+		ok("reusing healthy xovi-tripletap and its configuration")
 	} else {
-		ok("tripletap installed")
+		tt, err := fetchURL(tripletapURL)
+		if err != nil {
+			warn("download tripletap: %v — skipping; start xovi manually after reboots", err)
+		} else if out, err := d.RunIn("bash -s", strings.NewReader(string(tt))); err != nil {
+			warn("tripletap install didn't complete: %v: %s", err, tail(out, 300))
+			warn("you can still start xovi manually: ssh root@%s '/home/root/xovi/start'", d.Addr)
+		} else {
+			ok("tripletap installed")
+		}
 	}
 
 	// ---- 7. repair the SSH keystore tripletap knocks over -------------------
 	step("checking the SSH server survived")
 	repairSSH(d)
-	if fresh, err := device.ConnectKeyOnly(d.Addr); err == nil {
+	if fresh, err := d.Fresh(); err == nil {
 		fresh.Close()
 		ok("SSH healthy — verified with a fresh connection")
 	} else {
@@ -161,12 +225,10 @@ rm -rf appload-unz appload.zip`); err != nil {
 
 	// ---- 8. start xovi now ---------------------------------------------------
 	step("starting xovi (no reboot needed)")
-	if out, err := d.Run(`systemctl stop xovi-firststart 2>/dev/null; systemctl reset-failed xovi-firststart 2>/dev/null; \
-systemd-run --unit=xovi-firststart --collect --service-type=oneshot /home/root/xovi/start`); err != nil {
-		warn("couldn't start immediately (%s) — triple-press power, or reboot", tail(out, 120))
-	} else {
-		ok("xovi started — AppLoad should appear on the tablet")
+	if err := runSetupScript(d, "remagic-start", setupassets.StartXovi, 90*time.Second); err != nil {
+		die("AppLoad startup failed: %v; %s", err, restoreStock(d))
 	}
+	ok("AppLoad hooks loaded; xochitl remained stable")
 
 	// ---- 9. the Store ----------------------------------------------------------
 	step("installing the Store app (browse + install apps on the tablet itself)")
@@ -176,7 +238,7 @@ systemd-run --unit=xovi-firststart --collect --service-type=oneshot /home/root/x
 	} else {
 		// Starting xovi restarts xochitl, which can drop the long-lived SSH
 		// connection mid-push. A fresh connection almost always succeeds.
-		if fresh, cerr := device.ConnectKeyOnly(d.Addr); cerr == nil {
+		if fresh, cerr := d.Fresh(); cerr == nil {
 			if err2 := installFromCatalog(fresh, "store", catalogURL); err2 == nil {
 				storeOK = true
 			} else {
@@ -196,9 +258,9 @@ systemd-run --unit=xovi-firststart --collect --service-type=oneshot /home/root/x
 
     1. Wake the tablet — the reMarkable home screen looks unchanged. That's
        normal: your apps live inside the AppLoad launcher.
-    2. Open AppLoad from the tablet's main menu (the icon xovi added).
+    2. Open the top-left menu on My Files, then tap AppLoad.
        If you don't see it yet, triple-press the power button and wait a
-       few seconds — that toggles xovi on.`)
+       few seconds — that enables xovi.`)
 	if storeOK {
 		fmt.Println(`    3. Inside AppLoad, open the Store to browse and install apps —
        no computer needed from here on.`)
@@ -214,7 +276,7 @@ systemd-run --unit=xovi-firststart --collect --service-type=oneshot /home/root/x
     remagic wifi on           make the cable optional
     remagic doctor            health check any time
 
-  Triple-press the power button any time to toggle xovi on/off.
+  Triple-press enables xovi after reboot. Existing start/toggle settings remain.
   Re-run 'remagic setup' after a reMarkable OS update.`)
 }
 
@@ -225,57 +287,41 @@ systemd-run --unit=xovi-firststart --collect --service-type=oneshot /home/root/x
 // systemd unit because it stops xochitl, which can drop Wi-Fi SSH sessions —
 // we poll for completion over fresh connections instead.
 func rebuildHashtable(d *device.Device) error {
-	if _, err := d.Run("test -f /home/root/xovi/extensions.d/qt-resource-rebuilder.so"); err != nil {
-		return nil // bundle does no QML patching; nothing to build
-	}
-	const script = `#!/bin/bash
-set -u
-xovi=/home/root/xovi
-tab=$xovi/exthome/qt-resource-rebuilder/hashtab
-systemctl stop xochitl 2>/dev/null
-sleep 1
-export XOVI_ROOT=/tmp/xovi-hashtab
-rm -rf "$XOVI_ROOT"
-mkdir -p "$XOVI_ROOT/extensions.d"
-ln -s "$xovi/extensions.d/qt-resource-rebuilder.so" "$XOVI_ROOT/extensions.d/"
-mkdir -p "$(dirname "$tab")"
-rm -f "$tab"
-QMLDIFF_HASHTAB_CREATE="$tab" QML_DISABLE_DISK_CACHE=1 LD_PRELOAD="$xovi/xovi.so" /usr/bin/xochitl >/dev/null 2>&1 &
-pid=$!
-for i in $(seq 1 150); do [ -s "$tab" ] && break; sleep 1; done
-sleep 3
-kill $pid 2>/dev/null; sleep 2; kill -9 $pid 2>/dev/null
-rm -rf "$XOVI_ROOT" /tmp/remagic-hashtab.sh
-[ -s "$tab" ]
-`
-	if err := d.Push([]byte(script), "/tmp/remagic-hashtab.sh", "755"); err != nil {
+	return runSetupScript(d, "remagic-hashtab", setupassets.RebuildHashtable, 4*time.Minute)
+}
+
+func runSetupScript(d *device.Device, unit, script string, timeout time.Duration) error {
+	path := "/tmp/" + unit + ".sh"
+	result := "/tmp/" + unit + ".result"
+	if err := d.Push([]byte(script), path, "755"); err != nil {
 		return err
 	}
-	if out, err := d.Run(`systemctl stop remagic-hashtab 2>/dev/null; systemctl reset-failed remagic-hashtab 2>/dev/null; \
-systemd-run --unit=remagic-hashtab --collect /bin/bash /tmp/remagic-hashtab.sh`); err != nil {
-		return fmt.Errorf("launch rebuild unit: %v: %s", err, tail(out, 200))
+	command := "rm -f " + result + "; systemctl reset-failed " + unit + " 2>/dev/null; systemd-run --unit=" + unit + " --collect /bin/bash " + path
+	if out, err := d.Run(command); err != nil {
+		return fmt.Errorf("launch %s: %v: %s", unit, err, tail(out, 300))
 	}
-	// Poll over fresh connections; the unit stops xochitl, which can kill
-	// existing SSH sessions (observed over Wi-Fi).
-	deadline := time.Now().Add(4 * time.Minute)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		time.Sleep(5 * time.Second)
-		fresh, err := device.ConnectKeyOnly(d.Addr)
+		time.Sleep(3 * time.Second)
+		fresh, err := d.Fresh()
 		if err != nil {
-			continue // device busy restarting xochitl; keep waiting
+			continue
 		}
-		out, _ := fresh.Run("systemctl is-active remagic-hashtab || true")
-		if !strings.Contains(out, "active") || strings.Contains(out, "inactive") || strings.Contains(out, "failed") {
-			_, terr := fresh.Run("test -s /home/root/xovi/exthome/qt-resource-rebuilder/hashtab")
-			fresh.Close()
-			if terr != nil {
-				return fmt.Errorf("rebuild finished but no hashtab was written")
-			}
+		out, _ := fresh.Run("cat " + result + " 2>/dev/null")
+		fresh.Close()
+		switch strings.TrimSpace(out) {
+		case "success":
 			return nil
+		case "failed":
+			return fmt.Errorf("%s failed; inspect journalctl -u %s and /tmp/remagic-hashtab.log", unit, unit)
 		}
+	}
+	// Do not let a late background success enable hooks after recovery begins.
+	if fresh, err := d.Fresh(); err == nil {
+		fresh.Run("systemctl stop " + unit)
 		fresh.Close()
 	}
-	return fmt.Errorf("timed out after 4 minutes")
+	return fmt.Errorf("%s timed out", unit)
 }
 
 func isPaperPro(model string) bool {

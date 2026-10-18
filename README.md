@@ -65,16 +65,30 @@ Setup:
 2. **Installs your SSH key** — no more typing the device password.
 3. **Installs xovi + AppLoad** from official upstream releases.
 4. **Sets up persistence** via [xovi-tripletap](https://github.com/rmitchellscott/xovi-tripletap):
-   **triple-press the power button** to toggle xovi on or off. Survives reboots,
-   needs no computer, and can't bootloop you.
+   **triple-press the power button** to enable xovi after a reboot. Existing
+   tripletap settings, including start/toggle behavior, are preserved.
 5. **Installs the Store app**, so from then on you can browse and install apps
    right on the tablet — no computer needed.
 
-When it finishes, the **AppLoad** launcher appears on your tablet. You type
+When it finishes, open the top-left menu on **My Files**, then **AppLoad**.
+The normal reMarkable home screen remains visible until you open the launcher.
+You type
 the device password at most once: setup installs an SSH key (and generates
 one for you if you've never made one).
 
 After a reMarkable OS update, just run `remagic setup` again.
+
+Setup selects AppLoad v0.5.3 (ZIP) for older supported firmware and v0.6.0
+(tar.gz) for OS 3.28–3.29. It rebuilds the firmware-specific Qt resource table
+before enabling AppLoad and restores stock xochitl if rebuilding or startup
+validation fails. An existing healthy tripletap installation is reused.
+
+For SSH keys managed by an agent such as 1Password, use
+`remagic --skip-ssh-key setup` (or `./install.sh --skip-ssh-key`). This skips
+local key generation and changes to the tablet's authorized keys. The Go CLI
+uses `SSH_AUTH_SOCK` and discovers 1Password's standard Unix sockets;
+password authentication also survives setup reconnects,
+with the password kept only in memory.
 
 ---
 

@@ -6,6 +6,7 @@
 #   Usage:   ./install.sh              # USB (10.11.99.1)
 #            RM_HOST=192.168.1.42 ./install.sh   # over Wi-Fi
 #            ./install.sh --yes        # don't prompt for confirmations
+#            ./install.sh --skip-ssh-key  # preserve managed SSH authentication
 #
 # Prerequisite: developer mode ON (see docs/DEVELOPER-MODE.md). That's the only
 # manual step; everything below is automated.
@@ -16,6 +17,7 @@ source "$HERE/lib.sh"
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) export RM_ASSUME_YES=1 ;;
+        --skip-ssh-key) export RM_SKIP_SSH_KEY=1 ;;
         --host=*) export RM_HOST="${arg#*=}" ;;
         -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option: $arg (try --help)" ;;
@@ -41,7 +43,11 @@ EOF
 confirm "Proceed?" || die "Cancelled. Nothing changed."
 
 bash "$HERE/01-preflight.sh"
-bash "$HERE/02-ssh-key.sh"
+if [ "${RM_SKIP_SSH_KEY:-0}" = 1 ]; then
+    info "Preserving existing SSH keys (key setup skipped)."
+else
+    bash "$HERE/02-ssh-key.sh"
+fi
 bash "$HERE/03-install-xovi.sh"
 
 printf '\n%s%s  Done. Happy tinkering.%s\n' "$C_OK" "$C_B" "$C_0"
